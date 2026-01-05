@@ -1,0 +1,39 @@
+{
+  "feature_cols_log": [
+    "seller_sku",
+    "marketplace",
+    "price_month",
+    "category",
+    "subcategory",
+    "family_id",
+    "is_new",
+    "total_quantity",
+    "total_revenue",
+    "days_with_sales",
+    "marketplaces_type",
+    "year",
+    "month_num",
+    "is_q4",
+    "is_summer",
+    "qty_lag_1",
+    "qty_lag_2",
+    "qty_lag_3",
+    "qty_lag_6",
+    "qty_lag_12",
+    "qty_roll_mean_3",
+    "qty_roll_mean_6",
+    "qty_trend_3",
+    "price_lag_1",
+    "price_roll_mean_3"
+  ],
+  "cat_feature_indices": [
+    0,
+    1,
+    3,
+    4,
+    5,
+    10
+  ],
+  "target_col_log": "target_log",
+  "category_col": "category"
+}

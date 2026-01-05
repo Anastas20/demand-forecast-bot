@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+ENV/
+
+# База данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Модели машинного обучения
+*.cbm
+*.pkl
+*.joblib
+*.h5
+*.pb
+
+# Данные 
+# data/*.xlsx
+# data/raw/
+# data/forecasts/
+
+# Логи и временные файлы
+*.log
+*.tsv
+catboost_info/
+*.tmp
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Переменные окружения 
+.env
+.env.local
