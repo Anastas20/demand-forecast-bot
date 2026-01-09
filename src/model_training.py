@@ -19,12 +19,18 @@ import os
 import json
 from typing import Dict
 from datetime import datetime, timezone 
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
 
 from db import get_connection  
+
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_MODELS_DIR = BASE_DIR / "models"
 
 
 # ========= Метрики =========
@@ -240,6 +246,12 @@ def evaluate_before_after_calibration(
     Строит прогнозы на тесте и выводит метрики:
       - без калибровки,
       - с калибровкой по категориям.
+
+    Дополнительно возвращает словарь с метриками для:
+      - test_clean_nocal      (без сток-аутов, без калибровки)
+      - test_clean_calib      (без сток-аутов, с калибровкой)
+      - test_full_nocal       (полный тест, без калибровки)
+      - test_full_calib       (полный тест, с калибровкой)
     """
 
     test_pool_log = Pool(
@@ -263,33 +275,71 @@ def evaluate_before_after_calibration(
         y_pred = df_pred.loc[mask, "y_pred"].values
         y_pred_corr = df_pred.loc[mask, "y_pred_corr"].values
 
+        # метрики без калибровки
+        metrics_nocal = {
+            "rmse": rmse(y_true, y_pred),
+            "mae": mae(y_true, y_pred),
+            "mape": mape(y_true, y_pred),
+            "wape": wape(y_true, y_pred),
+            "bias": bias(y_true, y_pred),
+        }
+
+        # метрики с калибровкой
+        metrics_calib = {
+            "rmse": rmse(y_true, y_pred_corr),
+            "mae": mae(y_true, y_pred_corr),
+            "mape": mape(y_true, y_pred_corr),
+            "wape": wape(y_true, y_pred_corr),
+            "bias": bias(y_true, y_pred_corr),
+        }
+
+        # выводим в консоль, как и раньше
         print(f"\n=== {name} (без калибровки) ===")
-        print("RMSE:", rmse(y_true, y_pred))
-        print("MAE :", mae(y_true, y_pred))
-        print("MAPE:", mape(y_true, y_pred))
-        print("WAPE:", wape(y_true, y_pred))
-        print("Bias:", bias(y_true, y_pred))
+        print("RMSE:", metrics_nocal["rmse"])
+        print("MAE :", metrics_nocal["mae"])
+        print("MAPE:", metrics_nocal["mape"])
+        print("WAPE:", metrics_nocal["wape"])
+        print("Bias:", metrics_nocal["bias"])
 
         print(f"\n=== {name} (с калибровкой) ===")
-        print("RMSE:", rmse(y_true, y_pred_corr))
-        print("MAE :", mae(y_true, y_pred_corr))
-        print("MAPE:", mape(y_true, y_pred_corr))
-        print("WAPE:", wape(y_true, y_pred_corr))
-        print("Bias:", bias(y_true, y_pred_corr))
+        print("RMSE:", metrics_calib["rmse"])
+        print("MAE :", metrics_calib["mae"])
+        print("MAPE:", metrics_calib["mape"])
+        print("WAPE:", metrics_calib["wape"])
+        print("Bias:", metrics_calib["bias"])
 
+        return metrics_nocal, metrics_calib
+
+    # маски: без сток-аутов и полный тест
     mask_clean = df_pred["is_stockout_period"] == 0
     mask_all = np.ones(len(df_pred), dtype=bool)
 
-    eval_mask(mask_clean, "Test без сток-аута")
-    eval_mask(mask_all, "Test полный")
+    clean_nocal, clean_calib = eval_mask(mask_clean, "Test без сток-аута")
+    full_nocal, full_calib = eval_mask(mask_all, "Test полный")
+
+    # возвращаем метрики, чтобы сохранить их в JSON
+    return {
+        "test_clean_nocal": clean_nocal,
+        "test_clean_calib": clean_calib,
+        "test_full_nocal": full_nocal,
+        "test_full_calib": full_calib,
+    }
 
 
 # ========= Основная функция обучения =========
 
 def train_model(
-    model_dir: str = "../models",
+    model_dir: str | Path | None = None,
     category_col: str = "category",
 ):
+    # если путь не передали явно — используем /.../demand_forecast_bot/models
+    if model_dir is None:
+        model_dir = DEFAULT_MODELS_DIR
+    else:
+        model_dir = Path(model_dir)
+
+    os.makedirs(model_dir, exist_ok=True)
+
     # 1. Загружаем датасет из таблицы ml_monthly_base
     conn = get_connection()
     df = pd.read_sql_query("SELECT * FROM ml_monthly_base", conn)
@@ -308,12 +358,12 @@ def train_model(
     df_log = df.copy()
     df_log["target_log"] = np.log1p(df_log["qty_month"])
 
-    # 4. Формируем признаки и cat_features
-    feature_cols_log, cat_feature_indices = build_feature_space(df_log)
-
     train_df_log = df_log.loc[train_df.index].copy()
     val_df_log = df_log.loc[val_df.index].copy()
     test_df_log = df_log.loc[test_df.index].copy()
+
+    # 4. Формируем признаки и cat_features
+    feature_cols_log, cat_feature_indices = build_feature_space(df_log)
 
     train_pool_log = Pool(
         data=train_df_log[feature_cols_log],
@@ -326,15 +376,14 @@ def train_model(
         cat_features=cat_feature_indices,
     )
 
-    # 5. Обучаем финальную лог-модель
-    # --- диагностика таргета на train ---
+    # --- небольшая диагностика таргета на train (как ты уже делала) ---
     print("\nДиагностика train-таргета:")
     print("train qty_month nunique:", train_df_log["qty_month"].nunique())
     print(train_df_log["qty_month"].value_counts().head())
-
     print("train target_log nunique:", train_df_log["target_log"].nunique())
     print(train_df_log["target_log"].value_counts().head())
-    
+
+    # 5. Обучаем финальную лог-модель
     print("\n=== Обучение финальной лог-модели CatBoost ===")
     model_cb_log = CatBoostRegressor(**BEST_PARAMS_LOG)
     model_cb_log.fit(train_pool_log, eval_set=val_pool_log, verbose=100)
@@ -360,9 +409,9 @@ def train_model(
         category_col=category_col,
     )
 
-    # 8. Оценка на тесте до/после калибровки (для отчётности)
+    # 8. Оценка на тесте до/после калибровки (для отчётности + метрики)
     print("\n=== Оценка на тесте до и после калибровки ===")
-    evaluate_before_after_calibration(
+    test_metrics = evaluate_before_after_calibration(
         df_log=test_df_log,
         feature_cols_log=feature_cols_log,
         cat_feature_indices=cat_feature_indices,
@@ -371,21 +420,45 @@ def train_model(
         category_col=category_col,
     )
 
-    # 9. Сохраняем модель и метаданные
+    # 9. Сохраняем модель и метаданные (включая время обучения и метрики)
     os.makedirs(model_dir, exist_ok=True)
 
-    model_path = os.path.join(model_dir, "catboost_demand_log.cbm")
-    meta_path = os.path.join(model_dir, "model_meta.json")
-    calib_path = os.path.join(model_dir, "calib_by_category.json")
+    model_path = model_dir / "catboost_demand_log.cbm"
+    meta_path = model_dir / "model_meta.json"
+    calib_path = model_dir / "calib_by_category.json"
 
+    # сохраняем CatBoost-модель
     model_cb_log.save_model(model_path, format="cbm")
 
+    # время обучения в UTC
+    last_train_time = datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")
+
+    # метрики валидации
+    val_metrics = {
+        "rmse": float(rmse(y_val, val_pred_qty)),
+        "mae": float(mae(y_val, val_pred_qty)),
+        "mape": float(mape(y_val, val_pred_qty)),
+        "wape": float(wape(y_val, val_pred_qty)),
+        "bias": float(bias(y_val, val_pred_qty)),
+    }
+
+    # собираем всё в один словарь
     meta = {
         "feature_cols_log": feature_cols_log,
         "cat_feature_indices": list(cat_feature_indices),
         "target_col_log": "target_log",
         "category_col": category_col,
+        "last_train_time": last_train_time,
+        "metrics": {
+            "val": val_metrics,
+            # из test_metrics берём полный тест, с/без калибровки
+            "test_full_nocal": test_metrics["test_full_nocal"],
+            "test_full_calib": test_metrics["test_full_calib"],
+            # при желании можно также использовать test_clean_*
+        },
     }
+
+    # записываем метаданные и калибровку
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
@@ -395,6 +468,7 @@ def train_model(
     print(f"\nМодель сохранена в {model_path}")
     print(f"Метаданные сохранены в {meta_path}")
     print(f"Калибровка по категориям сохранена в {calib_path}")
+    print("В model_meta.json также сохранены время обучения и метрики качества.")
 
     # 10. Дополнительно сохраняем калибровочные коэффициенты в таблицу calibration_category (SQLite)
     conn = get_connection()
