@@ -36,6 +36,8 @@ from telegram.ext import (
     filters,
 )
 
+from telegram.ext import ApplicationBuilder
+
 # Импорты из проекта
 from ml_dataset_builder import build_ml_monthly_base
 from model_training import train_model
@@ -403,4 +405,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
