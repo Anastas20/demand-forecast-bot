@@ -189,41 +189,55 @@ async def train_model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Запуск прогноза на следующий месяц и выдача агрегированного Excel-файла.
+    Формирует прогноз на СЛЕДУЮЩИЙ месяц и отправляет ПОЛЬЗОВАТЕЛЮ
+    АГРЕГИРОВАННЫЙ файл forecast_agg_YYYY_MM.xlsx.
     """
     await update.message.reply_text(
-        "Запускаю формирование прогноза на следующий месяц. "
-        "Пожалуйста, подождите…"
+        "Запускаю формирование прогноза на следующий месяц. Пожалуйста, подождите…"
     )
 
-    try:
-        # 1) Сформировать прогноз по всем SKU/маркетплейсам
-        # (forecast_for_month сам возьмёт последний месяц из ML-датасета, если параметр не задан)
-        forecast_for_month()
+    # 1. Запускаем скрипт прогноза (он сам вызовет агрегатор и вернёт aggregated path)
+    cmd = [sys.executable, str(SRC_DIR / "forecast_next_month.py")]
 
-        # 2) Агрегировать прогноз по площадкам (до уровня SKU)
-        agg_path = aggregate_forecast()
+    try:
+        # синхронный запуск в отдельном потоке, чтобы не блокировать event loop
+        loop = asyncio.get_running_loop()
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        stdout = stdout.decode("utf-8", errors="ignore").strip()
+        stderr = stderr.decode("utf-8", errors="ignore").strip()
+
+        if proc.returncode != 0:
+            msg = "Ошибка при формировании прогноза."
+            if stderr:
+                msg += f"\nПодробности:\n{stderr}"
+            await update.message.reply_text(msg)
+            return
+
+        # 2. Ищем последний агрегированный файл forecast_agg_*.xlsx
+        agg_files = list(FORECASTS_DIR.glob("forecast_agg_*.xlsx"))
+        if not agg_files:
+            await update.message.reply_text(
+                "Прогноз сформирован, но агрегированный файл не найден."
+            )
+            return
+
+        latest_agg = max(agg_files, key=lambda p: p.stat().st_mtime)
+
+        # 3. Отправляем агрегированный прогноз пользователю
+        await update.message.reply_document(
+            document=open(latest_agg, "rb"),
+            filename=latest_agg.name,
+            caption="Агрегированный прогноз по SKU на следующий месяц.",
+        )
 
     except Exception as e:
-        logger.exception("Ошибка в /forecast")
-        await update.message.reply_text(f"Произошла ошибка при формировании прогноза: {e}")
-        return
+        await update.message.reply_text(f"Не удалось сформировать прогноз: {e}")
 
-    # 3) Отправляем файл пользователю
-    if not agg_path.exists():
-        await update.message.reply_text(
-            "Прогноз был выполнен, но агрегированный файл не найден."
-        )
-        return
-
-    await update.message.reply_text("Прогноз успешно сформирован, отправляю файл.")
-    with agg_path.open("rb") as f:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=f,
-            filename=agg_path.name,
-            caption="Агрегированный прогноз по SKU (сумма по маркетплейсам).",
-        )
 
 def fmt_metric(value) -> str:
     """Красиво форматирует число метрики или возвращает '-'."""

@@ -22,7 +22,7 @@ import pandas as pd
 from catboost import CatBoostRegressor, Pool
 
 from db import get_connection  # читаем данные и калибровку из SQLite
-
+from aggregate_forecast import aggregate_forecast 
 
 # ---------- Базовые пути (корень проекта / data / models / forecasts) ----------
 
@@ -217,6 +217,8 @@ def forecast_for_month(month_str: str | None = None):
         прогноз на МЕСЯЦ, СЛЕДУЮЩИЙ за последним в ml_monthly_base;
     - если month_str задан:
         прогноз/оценка для указанного месяца, который уже есть в ml_monthly_base.
+
+    Возвращает путь к АГРЕГИРОВАННОМУ файлу forecast_agg_YYYY_MM.xlsx.
     """
 
     # 1. Загружаем модель, метаданные и калибровку
@@ -280,19 +282,19 @@ def forecast_for_month(month_str: str | None = None):
     df_month["k_category"] = k_series
     df_month["y_pred_corr"] = df_month["y_pred"] * df_month["k_category"]
 
-    # # 7. Информационное сообщение про наличие факта
-    # if "qty_month" in df_month.columns and df_month["qty_month"].notna().any():
-    #     print(
-    #         f"В данных за {forecast_month.date()} есть фактические продажи – "
-    #         f"можно сравнить прогноз и факт."
-    #     )
-    # else:
-    #     print(
-    #         f"Фактический спрос за {forecast_month.date()} отсутствует или неизвестен – "
-    #         f"это прогноз на будущий месяц."
-    #     )
+    # 7. Информационное сообщение про наличие факта
+    if "qty_month" in df_month.columns and df_month["qty_month"].notna().any():
+        print(
+            f"В данных за {forecast_month.date()} есть фактические продажи – "
+            f"можно сравнить прогноз и факт."
+        )
+    else:
+        print(
+            f"Фактический спрос за {forecast_month.date()} отсутствует или неизвестен – "
+            f"это прогноз на будущий месяц."
+        )
 
-    # 8. Сохраняем результат
+    # 8. Сохраняем ПОМЕСЯЧНЫЙ прогноз по маркетплейсам
     FORECASTS_DIR.mkdir(parents=True, exist_ok=True)
     out_name = f"forecast_{forecast_month.strftime('%Y_%m')}.xlsx"
     out_path = FORECASTS_DIR / out_name
@@ -312,15 +314,21 @@ def forecast_for_month(month_str: str | None = None):
             cols_for_output.append(col)
 
     df_month[cols_for_output].to_excel(out_path, index=False)
-    print(f"Файл с прогнозом сохранён: {out_path}")
+    print(f"Файл с помесячным прогнозом (по маркетплейсам) сохранён: {out_path}")
 
-    return out_path
+    # 9. Агрегируем прогноз по маркетплейсам → один SKU = одна строка
+    agg_path = aggregate_forecast(out_path)
+    print(f"Агрегированный прогноз по SKU сохранён: {agg_path}")
+
+    return agg_path
 
 
 if __name__ == "__main__":
     # вариант 1: прогноз на следующий месяц после последнего месяца с фактами
-    forecast_for_month()
+    agg_path = forecast_for_month()
+    print(f"Агрегированный прогноз сохранён в: {agg_path}")
 
     # вариант 2: явный месяц (если нужно сравнить прогноз и факт для конкретного месяца)
     # forecast_for_month("2025-10-01")
     # forecast_for_month("2025-11-01")
+
