@@ -20,6 +20,8 @@ import json
 from typing import Dict
 from datetime import datetime, timezone 
 from zoneinfo import ZoneInfo
+from typing import Dict, Tuple
+
 
 import numpy as np
 import pandas as pd
@@ -196,12 +198,38 @@ def compute_category_calibration(
     cat_feature_indices,
     model_cb_log: CatBoostRegressor,
     category_col: str = "category",
-) -> Dict[str, float]:
+    min_total_qty_for_sku: int = 50,
+) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
-    Считает k по категориям на валидации (только без сток-аута).
-    k_cat = Σ y_true / Σ y_pred по категории.
+    Статистическая калибровка на валидации.
+
+    Возвращает:
+      - calib_by_category: k_cat по категориям
+        k_cat = Σ y_true / Σ y_pred, считается только
+        по строкам без сток-аута, с ненулевыми продажами и не для новых SKU.
+      - calib_by_sku: k_sku по "важным" SKU (суммарные продажи >= min_total_qty_for_sku)
+
+    Оба словаря предполагается использовать так:
+      y_pred_corr = y_pred * k_cat * k_sku,
+    где при отсутствии k для категории или SKU берётся 1.0.
     """
-    calib_df = df_val_log[df_val_log["is_stockout_period"] == 0].copy()
+
+    # 1. Фильтрация валидационной выборки для калибровки
+    calib_df = df_val_log[
+        (df_val_log["is_stockout_period"] == 0) &  # исключаем сток-ауты
+        (df_val_log["qty_month"] > 0) &            # только месяцы с фактическими продажами
+        (df_val_log["is_new"] == 0)                # исключаем совсем новые SKU
+    ].copy()
+
+    if calib_df.empty:
+        print(
+            "\n[WARN] calib_df пустой после фильтрации "
+            "(нет строк без сток-аута и с ненулевыми продажами). "
+            "Возвращаю пустые словари калибровки."
+        )
+        return {}, {}
+
+    # 2. Предсказания модели в лог-пространстве -> в штуках
     calib_pool = Pool(
         data=calib_df[feature_cols_log],
         label=calib_df["target_log"],
@@ -211,27 +239,67 @@ def compute_category_calibration(
     calib_pred_log = model_cb_log.predict(calib_pool)
     calib_pred_qty = np.expm1(calib_pred_log)
 
-    calib_df["y_true"] = calib_df["qty_month"].values
-    calib_df["y_pred"] = calib_pred_qty
+    calib_df["y_true"] = calib_df["qty_month"].astype(float)
+    calib_df["y_pred"] = calib_pred_qty.astype(float)
 
+    # 3. Калибровка по категориям
     cat_stats = (
         calib_df
-        .groupby(category_col)
+        .groupby(category_col, as_index=False)
         .agg(
             y_true_sum=("y_true", "sum"),
             y_pred_sum=("y_pred", "sum"),
         )
-        .reset_index()
     )
 
-    cat_stats["k"] = cat_stats["y_true_sum"] / cat_stats["y_pred_sum"]
-    cat_stats.loc[~np.isfinite(cat_stats["k"]), "k"] = 1.0
+    cat_stats["k_cat"] = cat_stats["y_true_sum"] / cat_stats["y_pred_sum"]
+    # заменяем бесконечности и NaN на 1.0
+    cat_stats.loc[~np.isfinite(cat_stats["k_cat"]), "k_cat"] = 1.0
+
+    calib_by_category: Dict[str, float] = dict(
+        zip(cat_stats[category_col], cat_stats["k_cat"])
+    )
 
     print("\nКалибровочные коэффициенты по категориям:")
-    print(cat_stats[[category_col, "k"]])
+    print(cat_stats[[category_col, "y_true_sum", "y_pred_sum", "k_cat"]])
 
-    calib_by_category = cat_stats.set_index(category_col)["k"].to_dict()
-    return calib_by_category
+    # 4. Дополнительная калибровка для «важных» SKU
+    sku_stats = (
+        calib_df
+        .groupby("seller_sku", as_index=False)
+        .agg(
+            y_true_sum=("y_true", "sum"),
+            y_pred_sum=("y_pred", "sum"),
+        )
+    )
+
+    # оставляем только крупные позиции, чтобы коэффициенты были устойчивыми
+    sku_stats = sku_stats[sku_stats["y_true_sum"] >= min_total_qty_for_sku].copy()
+
+    if sku_stats.empty:
+        calib_by_sku: Dict[str, float] = {}
+        print(
+            f"\nКалибровка по SKU: нет SKU с суммарными продажами "
+            f">= {min_total_qty_for_sku}, словарь calib_by_sku пустой."
+        )
+    else:
+        sku_stats["k_sku"] = sku_stats["y_true_sum"] / sku_stats["y_pred_sum"]
+        sku_stats.loc[~np.isfinite(sku_stats["k_sku"]), "k_sku"] = 1.0
+
+        calib_by_sku: Dict[str, float] = dict(
+            zip(sku_stats["seller_sku"], sku_stats["k_sku"])
+        )
+
+        print("\nКалибровочные коэффициенты по крупным SKU "
+              f"(порог = {min_total_qty_for_sku} штук, показываю топ-10 по обороту):")
+        print(
+            sku_stats[["seller_sku", "y_true_sum", "y_pred_sum", "k_sku"]]
+            .sort_values("y_true_sum", ascending=False)
+            .head(10)
+        )
+
+    return calib_by_category, calib_by_sku
+
 
 
 def evaluate_before_after_calibration(
@@ -268,6 +336,10 @@ def evaluate_before_after_calibration(
 
     # применяем k по category
     k_series = df_pred[category_col].map(calib_by_category).fillna(1.0)
+    # k_series = k_series + 1.0 
+    # raw_k = df_pred[category_col].map(calib_by_category)  # может быть NaN
+    # k_series = (raw_k + 1.0).fillna(1.0)
+
     df_pred["y_pred_corr"] = df_pred["y_pred"] * k_series
 
     def eval_mask(mask, name: str):
@@ -401,13 +473,13 @@ def train_model(
     print("Bias:", bias(y_val, val_pred_qty))
 
     # 7. Калибровка по категориям на валидации
-    calib_by_category = compute_category_calibration(
-        df_val_log=val_df_log,
-        feature_cols_log=feature_cols_log,
-        cat_feature_indices=cat_feature_indices,
-        model_cb_log=model_cb_log,
-        category_col=category_col,
-    )
+    calib_by_category, calib_by_sku = compute_category_calibration(
+        val_df_log,
+        feature_cols_log,
+        cat_feature_indices,
+        model_cb_log,
+        category_col="category",
+        )
 
     # 8. Оценка на тесте до/после калибровки (для отчётности + метрики)
     print("\n=== Оценка на тесте до и после калибровки ===")
@@ -448,6 +520,8 @@ def train_model(
         "cat_feature_indices": list(cat_feature_indices),
         "target_col_log": "target_log",
         "category_col": category_col,
+        "calib_by_category": calib_by_category,
+        "calib_by_sku": calib_by_sku,
         "last_train_time": last_train_time,
         "metrics": {
             "val": val_metrics,

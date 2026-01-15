@@ -8,6 +8,10 @@ ml_dataset_builder.py
 
 Учитывает, что часть числовых полей в БД сохранена как байты (BLOB),
 и переводит их обратно в целые числа.
+
+Дополнительно:
+- отфильтровывает SKU с очень маленькой историей продаж, чтобы
+  не засорять модель длинным «хвостом».
 """
 
 from pathlib import Path
@@ -19,6 +23,11 @@ from db import get_connection
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
+
+# --- Пороговые значения для отбора SKU в ML-датасет ---
+# Можно менять по необходимости:
+MIN_TOTAL_QTY_FOR_MODEL = 0   # минимальная суммарная продажа SKU за весь период
+MIN_DAYS_WITH_SALES_FOR_MODEL = 0 # минимальное число дней с продажами
 
 
 def bytes_to_int(val):
@@ -305,17 +314,35 @@ def build_ml_monthly_base():
         df_out[col] = pd.to_numeric(df_out[col], errors="coerce").fillna(0).astype(int)
 
     # ------------------------------------------------------------------
-    # 8. Сохраняем в таблицу ml_monthly_base
+    # 8. Фильтрация SKU с очень малой историей продаж
+    # ------------------------------------------------------------------
+    # Оставляем только те SKU, у которых:
+    # - суммарные продажи за весь период >= MIN_TOTAL_QTY_FOR_MODEL
+    # - число дней с продажами >= MIN_DAYS_WITH_SALES_FOR_MODEL
+    mask_keep = (
+        (df_out["total_quantity"].fillna(0) >= MIN_TOTAL_QTY_FOR_MODEL)
+        & (df_out["days_with_sales"].fillna(0) >= MIN_DAYS_WITH_SALES_FOR_MODEL)
+    )
+
+    df_model = df_out[mask_keep].copy()
+
+    print(
+        f"Всего строк в ml_monthly_base до фильтрации: {len(df_out)}; "
+        f"после фильтрации по активности SKU: {len(df_model)}"
+    )
+
+    # ------------------------------------------------------------------
+    # 9. Сохраняем в таблицу ml_monthly_base
     # ------------------------------------------------------------------
     with conn:
         conn.execute("DELETE FROM ml_monthly_base")
-        df_out.to_sql("ml_monthly_base", conn, if_exists="append", index=False)
+        df_model.to_sql("ml_monthly_base", conn, if_exists="append", index=False)
 
     conn.close()
 
-    print(f"Собран ml_monthly_base: {df_out.shape[0]} строк, {df_out.shape[1]} колонок.")
-    print("Пример распределения qty_month:")
-    print(df_out["qty_month"].describe())
+    print(f"Собран ml_monthly_base: {df_model.shape[0]} строк, {df_model.shape[1]} колонок.")
+    print("Пример распределения qty_month (после фильтрации):")
+    print(df_model["qty_month"].describe())
 
 
 if __name__ == "__main__":

@@ -3,7 +3,8 @@ forecast_next_month.py
 
 Скрипт для построения прогноза спроса на следующий месяц
 с использованием сохранённой лог-модели CatBoost и
-калибровочных коэффициентов по категориям.
+калибровочных коэффициентов по категориям и (опционально)
+по отдельным SKU.
 
 По умолчанию прогноз считается на месяц, следующий
 за последним месяцем, который есть в таблице ml_monthly_base
@@ -15,14 +16,13 @@ forecast_next_month.py
 
 from pathlib import Path
 import json
-import os
 
 import numpy as np
 import pandas as pd
 from catboost import CatBoostRegressor, Pool
 
 from db import get_connection  # читаем данные и калибровку из SQLite
-from aggregate_forecast import aggregate_forecast 
+from aggregate_forecast import aggregate_forecast
 
 # ---------- Базовые пути (корень проекта / data / models / forecasts) ----------
 
@@ -36,9 +36,17 @@ FORECASTS_DIR = DATA_DIR / "forecasts"
 
 def load_model_and_meta():
     """
-    Загружает CatBoost-модель, метаданные и калибровку по категориям.
+    Загружает CatBoost-модель, метаданные и калибровку.
 
-    Калибровка берётся из таблицы calibration_category, при ошибке – из calib_by_category.json.
+    Возвращает:
+    - model: обученная CatBoostRegressor
+    - feature_cols_log: список колонок-признаков в лог-модели
+    - cat_feature_indices: индексы категориальных признаков
+    - category_col: имя колонки с категорией (обычно "category")
+    - calib_by_category: словарь {category -> k_cat}
+      (считан либо из таблицы calibration_category, либо из calib_by_category.json)
+    - calib_by_sku: словарь {seller_sku -> k_sku} (если есть в model_meta.json),
+      иначе пустой dict.
     """
     model_path = MODELS_DIR / "catboost_demand_log.cbm"
     meta_path = MODELS_DIR / "model_meta.json"
@@ -58,6 +66,13 @@ def load_model_and_meta():
     feature_cols_log = meta["feature_cols_log"]
     cat_feature_indices = meta["cat_feature_indices"]
     category_col = meta.get("category_col", "category")
+
+    # SKU-калибровка (тонкая настройка для важных позиций) — если есть в meta
+    calib_by_sku = meta.get("calib_by_sku", {}) or {}
+    if calib_by_sku:
+        print(f"Загружено {len(calib_by_sku)} k_sku из model_meta.json.")
+    else:
+        print("В model_meta.json нет calib_by_sku — используем только категорийную калибровку.")
 
     # --- калибровка по категориям: сначала пробуем взять из БД ---
     calib_by_category = None
@@ -93,7 +108,14 @@ def load_model_and_meta():
             f"({len(calib_by_category)} категорий)."
         )
 
-    return model, feature_cols_log, cat_feature_indices, category_col, calib_by_category
+    return (
+        model,
+        feature_cols_log,
+        cat_feature_indices,
+        category_col,
+        calib_by_category,
+        calib_by_sku,
+    )
 
 
 def choose_forecast_month(df: pd.DataFrame, month_str: str | None = None) -> pd.Timestamp:
@@ -164,8 +186,6 @@ def build_next_month_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Timestamp
     if "month_num" in df_next.columns:
         df_next["month_num"] = month_num
     if "is_q4" in df_next.columns:
-        df_next["is_q4"] = (month_num in (10, 11, 12)).astype(int) if hasattr(month_num, "astype") else int(month_num in (10, 11, 12))
-        # но проще:
         df_next["is_q4"] = int(month_num in (10, 11, 12))
     if "is_summer" in df_next.columns:
         df_next["is_summer"] = int(month_num in (6, 7, 8))
@@ -222,9 +242,14 @@ def forecast_for_month(month_str: str | None = None):
     """
 
     # 1. Загружаем модель, метаданные и калибровку
-    model, feature_cols_log, cat_feature_indices, category_col, calib_by_category = (
-        load_model_and_meta()
-    )
+    (
+        model,
+        feature_cols_log,
+        cat_feature_indices,
+        category_col,
+        calib_by_category,
+        calib_by_sku,
+    ) = load_model_and_meta()
 
     # 2. Загружаем датасет из таблицы ml_monthly_base
     conn = get_connection()
@@ -277,10 +302,18 @@ def forecast_for_month(month_str: str | None = None):
     y_pred = np.expm1(pred_log)
     df_month["y_pred"] = y_pred
 
-    # 6. Применяем калибровку по категориям
-    k_series = df_month[category_col].map(calib_by_category).fillna(1.0)
-    df_month["k_category"] = k_series
-    df_month["y_pred_corr"] = df_month["y_pred"] * df_month["k_category"]
+    # 6. Применяем калибровку:
+    #    k_cat — по категориям, k_sku — по отдельным важным SKU (если есть),
+    #    общий коэффициент k_total = k_cat * k_sku.
+    k_cat = df_month[category_col].map(calib_by_category).fillna(1.0)
+    df_month["k_category"] = k_cat
+
+    # если calib_by_sku пустой, все k_sku = 1.0 и k_total == k_cat
+    k_sku = df_month["seller_sku"].map(calib_by_sku).fillna(1.0)
+    df_month["k_sku"] = k_sku
+
+    df_month["k_total"] = k_cat * k_sku
+    df_month["y_pred_corr"] = df_month["y_pred"] * df_month["k_total"]
 
     # 7. Информационное сообщение про наличие факта
     if "qty_month" in df_month.columns and df_month["qty_month"].notna().any():
@@ -307,7 +340,9 @@ def forecast_for_month(month_str: str | None = None):
         category_col,
         "qty_month",      # фактические продажи, если есть
         "y_pred",         # прогноз до калибровки
-        "k_category",     # коэффициент калибровки
+        "k_category",     # коэффициент калибровки по категории
+        "k_sku",          # дополнительная калибровка по SKU (если есть)
+        "k_total",        # итоговый коэффициент
         "y_pred_corr",    # откалиброванный прогноз
     ]:
         if col in df_month.columns:
@@ -331,4 +366,3 @@ if __name__ == "__main__":
     # вариант 2: явный месяц (если нужно сравнить прогноз и факт для конкретного месяца)
     # forecast_for_month("2025-10-01")
     # forecast_for_month("2025-11-01")
-
